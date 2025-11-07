@@ -78,10 +78,11 @@ public class MyBot {
                                         }))
                                 .then();
                     })
-                    .onErrorContinue((t, o) -> {
+                    .doOnError(t -> {
                         System.err.println("[Handler] Exception: " + t.getClass().getName() + " - " + t.getMessage());
                         t.printStackTrace();
                     })
+                    .onErrorResume(e -> Mono.empty())
                     .then();
 
             return printOnLogin.and(messages);

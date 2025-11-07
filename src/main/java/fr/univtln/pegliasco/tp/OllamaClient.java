@@ -1,16 +1,15 @@
-// Java
 package fr.univtln.pegliasco.tp;
 
 import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.netty.channel.ChannelOption;
 import reactor.core.publisher.Mono;
+import reactor.netty.ByteBufFlux;
 import reactor.netty.http.client.HttpClient;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
 public class OllamaClient {
@@ -42,21 +41,21 @@ public class OllamaClient {
 
     public Mono<String> generate(String userMessage) {
         String payload = buildPayload(userMessage);
-        byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);
-        Mono<ByteBuf> body = Mono.just(Unpooled.wrappedBuffer(bytes));
 
         return client
                 .post()
                 .uri(apiUrl)
-                .send(body)
-                .responseSingle((res, buf) -> {
-                    int code = res.status().code();
-                    if (code < 200 || code >= 300) {
-                        return Mono.error(new IllegalStateException("HTTP " + code));
-                    }
-                    return buf.asByteArray()
-                            .map(arr -> new String(arr, StandardCharsets.UTF_8));
-                })
+                .send(ByteBufFlux.fromString(Mono.just(payload)))
+                .responseSingle((res, content) ->
+                        content.asString().flatMap(body -> {
+                            int code = res.status().code();
+                            if (code < 200 || code >= 300) {
+                                System.err.println("HTTP " + code + " - Corps: " + truncate(body, 512));
+                                return Mono.error(new IllegalStateException("HTTP " + code));
+                            }
+                            return Mono.just(body);
+                        })
+                )
                 .flatMap(this::extractText)
                 .timeout(RESPONSE_TIMEOUT);
     }
@@ -64,7 +63,11 @@ public class OllamaClient {
     private Mono<String> extractText(String body) {
         try {
             JsonNode json = mapper.readTree(body);
-            String value = json.path("response").isMissingNode() ? null : json.path("response").asText();
+            JsonNode node = json.path("response");
+            if (node.isMissingNode() || node.asText().isBlank()) node = json.path("message");
+            if (node.isMissingNode() || node.asText().isBlank()) node = json.path("content");
+
+            String value = node.isMissingNode() ? null : node.asText();
             if (value != null && !value.isBlank()) return Mono.just(value);
             if (body != null && !body.isBlank()) return Mono.just(body);
             return Mono.error(new IllegalStateException("Réponse vide"));
@@ -75,11 +78,17 @@ public class OllamaClient {
     }
 
     private String buildPayload(String userMessage) {
-        return "{\"message\":" + toJsonString(userMessage) + "}";
+        try {
+            ObjectNode root = mapper.createObjectNode();
+            root.put("message", userMessage);
+            return mapper.writeValueAsString(root);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Impossible de sérialiser la requête", e);
+        }
     }
 
-    private static String toJsonString(String s) {
-        if (s == null) return "null";
-        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "...";
     }
 }
