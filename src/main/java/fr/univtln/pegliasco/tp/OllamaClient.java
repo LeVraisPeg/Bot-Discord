@@ -15,7 +15,7 @@ import java.time.Duration;
 public class OllamaClient {
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(5);
-    private static final Duration RESPONSE_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration RESPONSE_TIMEOUT = Duration.ofSeconds(120);
 
     private final ObjectMapper mapper;
     private final HttpClient client;
