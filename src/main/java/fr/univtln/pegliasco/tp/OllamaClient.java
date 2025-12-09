@@ -40,8 +40,31 @@ public class OllamaClient {
     }
 
     public Mono<String> generate(String userMessage) {
-        String payload = buildPayload(userMessage);
+        String payload = buildPayload(userMessage, null);
+        return send(payload).flatMap(this::extractText).timeout(RESPONSE_TIMEOUT);
+    }
 
+    // Prompt dédié pour /teach
+    public Mono<String> generateTeaching(String concept) {
+        String instruction = "Explique clairement et de façon pédagogique le concept suivant pour un public technique, " +
+                "avec une structure courte: définition, pourquoi c'est utile, exemple simple, pièges courants.\nConcept: " + concept;
+        String payload = buildPayload(instruction, "teach");
+        return send(payload).flatMap(this::extractText).timeout(RESPONSE_TIMEOUT);
+    }
+    // Prompt dédié pour /translate
+    public Mono<String> generateTranslation(String text) {
+        String instruction = "Traduis le texte suivant en français de manière fluide et naturelle:\n\"" + text + "\"";
+        String payload = buildPayload(instruction, "translate");
+        return send(payload).flatMap(this::extractText).timeout(RESPONSE_TIMEOUT);
+    }
+    // Prompt dédié pour /summarize
+    public Mono<String> generateSummary(String text) {
+        String instruction = "Fais un résumé concis et clair du texte suivant en français:\n\"" + text + "\"";
+        String payload = buildPayload(instruction, "summarize");
+        return send(payload).flatMap(this::extractText).timeout(RESPONSE_TIMEOUT);
+    }
+
+    private Mono<String> send(String payload) {
         return client
                 .post()
                 .uri(apiUrl)
@@ -55,9 +78,7 @@ public class OllamaClient {
                             }
                             return Mono.just(body);
                         })
-                )
-                .flatMap(this::extractText)
-                .timeout(RESPONSE_TIMEOUT);
+                );
     }
 
     private Mono<String> extractText(String body) {
@@ -77,10 +98,13 @@ public class OllamaClient {
         }
     }
 
-    private String buildPayload(String userMessage) {
+    private String buildPayload(String userMessage, String mode) {
         try {
             ObjectNode root = mapper.createObjectNode();
             root.put("message", userMessage);
+            if (mode != null) {
+                root.put("mode", mode);
+            }
             return mapper.writeValueAsString(root);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Impossible de sérialiser la requête", e);
