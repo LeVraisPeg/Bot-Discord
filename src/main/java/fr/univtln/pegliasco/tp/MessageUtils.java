@@ -18,7 +18,8 @@ public final class MessageUtils {
         final int n = text.length();
 
         while (start < n) {
-            int end = Math.min(start + DISCORD_LIMIT, n);
+            int hardEnd = Math.min(start + DISCORD_LIMIT, n);
+            int cut;
 
             // Évite de couper une paire supplémente (emoji)
             if (end < n && Character.isLowSurrogate(text.charAt(end - 1))) {
