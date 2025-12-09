@@ -12,7 +12,12 @@ import discord4j.discordjson.json.ApplicationCommandRequest;
 import io.github.cdimascio.dotenv.Dotenv;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.netty.http.client.HttpClient;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,6 +25,8 @@ import org.slf4j.LoggerFactory;
 public class MyBot {
 
     private static final Logger log = LoggerFactory.getLogger(MyBot.class);
+    // Index mémoire : channelId -> textes des pièces jointes du salon
+    private static final Map<Long, List<String>> CHANNEL_DOCUMENTS = new ConcurrentHashMap<>();
 
     public static void main(String[] args) {
         Dotenv dotenv = Dotenv.load();
@@ -31,6 +38,8 @@ public class MyBot {
         client.withGateway(gateway -> {
             Snowflake selfId = gateway.getSelfId();
 
+            HttpClient httpClient = HttpClient.create();
+
             Mono<Long> applicationIdMono = gateway.getRestClient().getApplicationId();
 
             Mono<Void> printOnLogin = gateway.on(ReadyEvent.class, evt ->
@@ -39,6 +48,8 @@ public class MyBot {
                                     evt.getSelf().getUsername(),
                                     evt.getSelf().getDiscriminator()))
             ).then();
+
+            /* ---------- /teach ---------- */
 
             ApplicationCommandRequest teachCmd = ApplicationCommandRequest.builder()
                     .name("teach")
@@ -76,6 +87,8 @@ public class MyBot {
                         return Mono.empty();
                     });
 
+            /* ---------- /translate ---------- */
+
             ApplicationCommandRequest translateCmd = ApplicationCommandRequest.builder()
                     .name("translate")
                     .description("Traduire un texte en français.")
@@ -111,6 +124,8 @@ public class MyBot {
                         log.error("Erreur lors de l'enregistrement de /translate : {}", e.getMessage(), e);
                         return Mono.empty();
                     });
+
+            /* ---------- /summarize ---------- */
 
             ApplicationCommandRequest summarizeCmd = ApplicationCommandRequest.builder()
                     .name("summarize")
@@ -148,6 +163,45 @@ public class MyBot {
                         return Mono.empty();
                     });
 
+            /* ---------- /qa ---------- */
+
+            ApplicationCommandRequest qaCmd = ApplicationCommandRequest.builder()
+                    .name("qa")
+                    .description("Question-réponse basée sur les documents envoyés dans ce salon.")
+                    .addOption(ApplicationCommandOptionData.builder()
+                            .name("question")
+                            .description("La question à poser sur les documents du salon.")
+                            .type(3)
+                            .required(true)
+                            .build())
+                    .build();
+
+            Mono<Void> registerQa = applicationIdMono
+                    .flatMap(appId ->
+                            gateway.getRestClient().getApplicationService()
+                                    .getGlobalApplicationCommands(appId)
+                                    .collectList()
+                                    .flatMap(existing -> {
+                                        boolean hasQa = existing.stream()
+                                                .anyMatch(cmd -> "qa".equalsIgnoreCase(cmd.name()));
+                                        if (hasQa) {
+                                            log.info("Commande globale /qa déjà enregistrée.");
+                                            return Mono.empty();
+                                        }
+                                        log.info("Enregistrement de la commande globale /qa...");
+                                        return gateway.getRestClient().getApplicationService()
+                                                .createGlobalApplicationCommand(appId, qaCmd)
+                                                .doOnSuccess(cmd ->
+                                                        log.info("Commande globale /qa enregistrée (id={})", cmd.id()))
+                                                .then();
+                                    })
+                    )
+                    .onErrorResume(e -> {
+                        log.error("Erreur lors de l'enregistrement de /qa : {}", e.getMessage(), e);
+                        return Mono.empty();
+                    });
+
+            /* ---------- Messages + index des fichiers ---------- */
 
             Mono<Void> messages = gateway.on(MessageCreateEvent.class, evt -> {
                         Message message = evt.getMessage();
@@ -155,21 +209,71 @@ public class MyBot {
 
                         log.debug("Message reçu : {}", content);
 
+                        // 1) Indexer les pièces jointes texte pour /qa
+                        Mono<Void> attachmentIndexing = Flux.fromIterable(message.getAttachments())
+                                .flatMap(att -> {
+                                    String url = att.getUrl();
+                                    String filename = att.getFilename();
+                                    String contentType = att.getContentType().orElse("");
+
+                                    long channelId = message.getChannelId().asLong();
+
+                                    // On ne traite que les fichiers text/*
+                                    if (!contentType.isEmpty() && !contentType.startsWith("text/")) {
+                                        log.info("Pièce jointe ignorée (type non texte) : {} ({})",
+                                                filename, contentType);
+                                        return Mono.empty();
+                                    }
+
+                                    log.info("Pièce jointe texte reçue dans le salon {} : {} ({})",
+                                            channelId, filename, contentType);
+
+                                    return httpClient
+                                            .get()
+                                            .uri(url)
+                                            .responseSingle((res, buf) -> {
+                                                int code = res.status().code();
+                                                if (code < 200 || code >= 300) {
+                                                    log.warn("Échec téléchargement fichier {} : HTTP {}",
+                                                            filename, code);
+                                                    return Mono.empty();
+                                                }
+                                                return buf.asString();
+                                            })
+                                            .doOnNext(text -> {
+                                                CHANNEL_DOCUMENTS
+                                                        .computeIfAbsent(channelId, k -> new ArrayList<>())
+                                                        .add(text);
+                                                log.info("Texte indexé depuis {} pour le salon {} ({} caractères)",
+                                                        filename, channelId, text.length());
+                                            })
+                                            .onErrorResume(e -> {
+                                                log.error("Erreur téléchargement pièce jointe {} : {}",
+                                                        filename, e.getMessage(), e);
+                                                return Mono.empty();
+                                            })
+                                            .then();
+                                })
+                                .then();
+
+                        // 2) Ignorer les messages du bot lui-même
                         if (message.getAuthor().map(User::getId).filter(id -> id.equals(selfId)).isPresent()) {
                             log.debug("Message ignoré : vient du bot lui-même.");
-                            return Mono.empty();
+                            return attachmentIndexing;
                         }
 
+                        // 3) Ignorer le JSON brut
                         if (content.trim().startsWith("{")) {
                             log.debug("Message ignoré : JSON détecté.");
-                            return Mono.empty();
+                            return attachmentIndexing;
                         }
 
+                        // 4) Répondre seulement si mention du bot
                         boolean isMentioned = message.getUserMentions().stream()
                                 .anyMatch(u -> u.getId().equals(selfId));
                         if (!isMentioned) {
                             log.debug("Message ignoré : pas de mention du bot.");
-                            return Mono.empty();
+                            return attachmentIndexing;
                         }
 
                         String sanitized = content
@@ -179,12 +283,12 @@ public class MyBot {
 
                         if (sanitized.isBlank()) {
                             log.debug("Message ignoré : contenu vide après suppression de la mention.");
-                            return Mono.empty();
+                            return attachmentIndexing;
                         }
 
                         log.info("Message mentionné nettoyé : {}", sanitized);
 
-                        return ollama.generate(sanitized)
+                        Mono<Void> reply = ollama.generate(sanitized)
                                 .map(MessageUtils::escapeDiscordMarkdown)
                                 .onErrorResume(e -> {
                                     log.error("Erreur appel modèle : {}", e.getMessage(), e);
@@ -198,12 +302,16 @@ public class MyBot {
                                             return Mono.empty();
                                         }))
                                 .then();
+
+                        return attachmentIndexing.then(reply);
                     })
                     .onErrorResume(e -> {
                         log.error("Erreur dans handler MessageCreateEvent : {}", e.getMessage(), e);
                         return Mono.empty();
                     })
                     .then();
+
+            /* ---------- /teach handler ---------- */
 
             Mono<Void> teachCommand = gateway.on(ChatInputInteractionEvent.class, evt -> {
                         if (!"teach".equalsIgnoreCase(evt.getCommandName())) {
@@ -233,7 +341,9 @@ public class MyBot {
                                                     log.error("Erreur traitement teach : {}", e.getMessage(), e);
                                                     return Mono.just("Erreur lors de l'explication du concept.");
                                                 })
-                                                .flatMap(resp -> evt.createFollowup().withContent(resp))
+                                                // SPLIT ICI
+                                                .flatMapMany(resp -> Flux.fromIterable(MessageUtils.splitForDiscord(resp)))
+                                                .concatMap(part -> evt.createFollowup().withContent(part))
                                                 .then()
                                 );
                     })
@@ -242,6 +352,8 @@ public class MyBot {
                         return Mono.empty();
                     })
                     .then();
+
+            /* ---------- /translate handler ---------- */
 
             Mono<Void> translateCommand = gateway.on(ChatInputInteractionEvent.class, evt -> {
                         if (!"translate".equalsIgnoreCase(evt.getCommandName())) {
@@ -271,7 +383,8 @@ public class MyBot {
                                                     log.error("Erreur traduction : {}", e.getMessage(), e);
                                                     return Mono.just("Erreur lors de la traduction du texte.");
                                                 })
-                                                .flatMap(resp -> evt.createFollowup().withContent(resp))
+                                                .flatMapMany(resp -> Flux.fromIterable(MessageUtils.splitForDiscord(resp)))
+                                                .concatMap(part -> evt.createFollowup().withContent(part))
                                                 .then()
                                 );
                     })
@@ -280,6 +393,8 @@ public class MyBot {
                         return Mono.empty();
                     })
                     .then();
+
+            /* ---------- /summarize handler ---------- */
 
             Mono<Void> summarizeCommand = gateway.on(ChatInputInteractionEvent.class, evt -> {
                         if (!"summarize".equalsIgnoreCase(evt.getCommandName())) {
@@ -309,7 +424,8 @@ public class MyBot {
                                                     log.error("Erreur résumé : {}", e.getMessage(), e);
                                                     return Mono.just("Erreur lors du résumé du texte.");
                                                 })
-                                                .flatMap(resp -> evt.createFollowup().withContent(resp))
+                                                .flatMapMany(resp -> Flux.fromIterable(MessageUtils.splitForDiscord(resp)))
+                                                .concatMap(part -> evt.createFollowup().withContent(part))
                                                 .then()
                                 );
                     })
@@ -319,15 +435,87 @@ public class MyBot {
                     })
                     .then();
 
+            /* ---------- /qa handler ---------- */
 
-            return registerTeach
+            Mono<Void> qaCommand = gateway.on(ChatInputInteractionEvent.class, evt -> {
+                        if (!"qa".equalsIgnoreCase(evt.getCommandName())) {
+                            return Mono.empty();
+                        }
+
+                        log.info("Interaction /qa reçue");
+
+                        String question = evt.getOption("question")
+                                .flatMap(opt -> opt.getValue())
+                                .map(v -> v.asString().trim())
+                                .orElse("");
+
+                        log.info("Question reçue pour /qa : {}", question);
+
+                        if (question.isBlank()) {
+                            return evt.reply()
+                                    .withEphemeral(true)
+                                    .withContent("Veuillez fournir une question.");
+                        }
+
+                        long channelId = evt.getInteraction().getChannelId().asLong();
+                        List<String> docs = CHANNEL_DOCUMENTS.get(channelId);
+
+                        if (docs == null || docs.isEmpty()) {
+                            log.info("Aucun document indexé pour le salon {}", channelId);
+                            return evt.reply()
+                                    .withEphemeral(true)
+                                    .withContent(
+                                            "Aucun document n'a encore été indexé sur ce salon.\n" +
+                                                    "Envoyez d'abord un ou plusieurs fichiers texte, puis réessayez /qa."
+                                    );
+                        }
+
+                        // Construire un contexte à partir des documents du salon
+                        StringBuilder contextBuilder = new StringBuilder();
+                        for (String d : docs) {
+                            String trimmed = d;
+                            if (trimmed.length() > 2000) {
+                                trimmed = trimmed.substring(0, 2000) + "\n...[tronqué]...";
+                            }
+                            contextBuilder.append(trimmed).append("\n\n---\n\n");
+                        }
+                        String context = contextBuilder.toString();
+
+                        return evt.deferReply()
+                                .then(
+                                        ollama.generateQA(context, question)
+                                                .map(MessageUtils::escapeDiscordMarkdown)
+                                                .onErrorResume(e -> {
+                                                    log.error("Erreur /qa : {}", e.getMessage(), e);
+                                                    return Mono.just("Erreur lors du traitement de la question.");
+                                                })
+                                                .flatMapMany(resp -> Flux.fromIterable(MessageUtils.splitForDiscord(resp)))
+                                                .concatMap(part -> evt.createFollowup().withContent(part))
+                                                .then()
+                                );
+                    })
+                    .onErrorResume(e -> {
+                        log.error("Erreur handler qa : {}", e.getMessage(), e);
+                        return Mono.empty();
+                    })
+                    .then();
+
+
+            // D'abord : enregistrer toutes les commandes
+            Mono<Void> registerAll = registerTeach
                     .then(registerTranslate)
                     .then(registerSummarize)
-                    .then(printOnLogin)
-                    .then(messages)
-                    .then(teachCommand)
-                    .then(translateCommand)
-                    .then(summarizeCommand);
+                    .then(registerQa);
+
+            // Puis : lancer tous les handlers "en parallèle"
+            Mono<Void> handlers = printOnLogin
+                    .and(messages)
+                    .and(teachCommand)
+                    .and(translateCommand)
+                    .and(summarizeCommand)
+                    .and(qaCommand);
+
+            return registerAll.then(handlers);
 
         }).block();
     }

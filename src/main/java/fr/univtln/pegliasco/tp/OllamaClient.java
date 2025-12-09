@@ -64,6 +64,15 @@ public class OllamaClient {
         return send(payload).flatMap(this::extractText).timeout(RESPONSE_TIMEOUT);
     }
 
+    // Prompt dédié pour /qa
+    public Mono<String> generateQA(String context, String question) {
+        String instruction = "En te basant sur le contexte suivant, réponds de manière précise à la question posée. " +
+                "Si l'information n'est pas présente dans le contexte, indique que tu ne sais pas.\n" +
+                "Contexte: \"" + context + "\"\nQuestion: \"" + question + "\"";
+        String payload = buildPayload(instruction, "qa");
+        return send(payload).flatMap(this::extractText).timeout(RESPONSE_TIMEOUT);
+    }
+
     private Mono<String> send(String payload) {
         return client
                 .post()
