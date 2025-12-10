@@ -14,6 +14,8 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.netty.http.client.HttpClient;
 
+import io.netty.buffer.Unpooled;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -25,15 +27,16 @@ import org.slf4j.LoggerFactory;
 public class MyBot {
 
     private static final Logger log = LoggerFactory.getLogger(MyBot.class);
-    // Index mémoire : channelId -> textes des pièces jointes du salon
     private static final Map<Long, List<String>> CHANNEL_DOCUMENTS = new ConcurrentHashMap<>();
 
     public static void main(String[] args) {
         Dotenv dotenv = Dotenv.load();
+        ApiConfig api = new ApiConfig(dotenv);
+
         String token = dotenv.get("DISCORD_TOKEN");
         DiscordClient client = DiscordClient.create(token);
 
-        OllamaClient ollama = new OllamaClient("http://localhost:8080/ollama");
+        OllamaClient ollama = new OllamaClient(api.ollamaUrl());
 
         client.withGateway(gateway -> {
             Snowflake selfId = gateway.getSelfId();
@@ -201,6 +204,54 @@ public class MyBot {
                         return Mono.empty();
                     });
 
+            /*---------- role ---------- */
+            ApplicationCommandRequest roleCmd = ApplicationCommandRequest.builder()
+                    .name("role")
+                    .description("Gestion des rôles via API")
+                    .addOption(ApplicationCommandOptionData.builder()
+                            .name("create")
+                            .description("Créer un rôle")
+                            .type(1) // SUB_COMMAND
+                            .addOption(ApplicationCommandOptionData.builder()
+                                    .name("name")
+                                    .description("Nom du rôle")
+                                    .type(3) // STRING
+                                    .required(true)
+                                    .build())
+                            .addOption(ApplicationCommandOptionData.builder()
+                                    .name("permissions")
+                                    .description("Permissions (séparées par des virgules)")
+                                    .type(3) // STRING
+                                    .required(true)
+                                    .build())
+                            .build())
+                    .build();
+
+            Mono<Void> registerRole = applicationIdMono
+                    .flatMap(appId ->
+                            gateway.getRestClient().getApplicationService()
+                                    .getGlobalApplicationCommands(appId)
+                                    .collectList()
+                                    .flatMap(existing -> {
+                                        boolean hasRole = existing.stream()
+                                                .anyMatch(cmd -> "role".equalsIgnoreCase(cmd.name()));
+                                        if (hasRole) {
+                                            log.info("Commande globale /role déjà enregistrée.");
+                                            return Mono.empty();
+                                        }
+                                        log.info("Enregistrement de la commande globale /role...");
+                                        return gateway.getRestClient().getApplicationService()
+                                                .createGlobalApplicationCommand(appId, roleCmd)
+                                                .doOnSuccess(cmd ->
+                                                        log.info("Commande globale /role enregistrée (id={})", cmd.id()))
+                                                .then();
+                                    })
+                    )
+                    .onErrorResume(e -> {
+                        log.error("Erreur lors de l'enregistrement de /role : {}", e.getMessage(), e);
+                        return Mono.empty();
+                    });
+
             /* ---------- Messages + index des fichiers ---------- */
 
             Mono<Void> messages = gateway.on(MessageCreateEvent.class, evt -> {
@@ -209,7 +260,6 @@ public class MyBot {
 
                         log.debug("Message reçu : {}", content);
 
-                        // 1) Indexer les pièces jointes texte pour /qa
                         Mono<Void> attachmentIndexing = Flux.fromIterable(message.getAttachments())
                                 .flatMap(att -> {
                                     String url = att.getUrl();
@@ -218,7 +268,6 @@ public class MyBot {
 
                                     long channelId = message.getChannelId().asLong();
 
-                                    // On ne traite que les fichiers text/*
                                     if (!contentType.isEmpty() && !contentType.startsWith("text/")) {
                                         log.info("Pièce jointe ignorée (type non texte) : {} ({})",
                                                 filename, contentType);
@@ -256,19 +305,16 @@ public class MyBot {
                                 })
                                 .then();
 
-                        // 2) Ignorer les messages du bot lui-même
                         if (message.getAuthor().map(User::getId).filter(id -> id.equals(selfId)).isPresent()) {
                             log.debug("Message ignoré : vient du bot lui-même.");
                             return attachmentIndexing;
                         }
 
-                        // 3) Ignorer le JSON brut
                         if (content.trim().startsWith("{")) {
                             log.debug("Message ignoré : JSON détecté.");
                             return attachmentIndexing;
                         }
 
-                        // 4) Répondre seulement si mention du bot
                         boolean isMentioned = message.getUserMentions().stream()
                                 .anyMatch(u -> u.getId().equals(selfId));
                         if (!isMentioned) {
@@ -341,7 +387,6 @@ public class MyBot {
                                                     log.error("Erreur traitement teach : {}", e.getMessage(), e);
                                                     return Mono.just("Erreur lors de l'explication du concept.");
                                                 })
-                                                // SPLIT ICI
                                                 .flatMapMany(resp -> Flux.fromIterable(MessageUtils.splitForDiscord(resp)))
                                                 .concatMap(part -> evt.createFollowup().withContent(part))
                                                 .then()
@@ -470,7 +515,6 @@ public class MyBot {
                                     );
                         }
 
-                        // Construire un contexte à partir des documents du salon
                         StringBuilder contextBuilder = new StringBuilder();
                         for (String d : docs) {
                             String trimmed = d;
@@ -500,23 +544,127 @@ public class MyBot {
                     })
                     .then();
 
+            /* ---------- /role handler ---------- */
+            Mono<Void> roleCommand = gateway.on(ChatInputInteractionEvent.class, evt -> {
+                if (!"role".equalsIgnoreCase(evt.getCommandName())) {
+                    return Mono.empty();
+                }
 
-            // D'abord : enregistrer toutes les commandes
+                log.info("Interaction /role reçue");
+
+                var createOpt = evt.getOption("create");
+                if (createOpt.isEmpty()) {
+                    log.info("Sous-commande /role create absente");
+                    return Mono.empty();
+                }
+
+                String roleName = createOpt
+                        .flatMap(o -> o.getOption("name"))
+                        .flatMap(opt -> opt.getValue())
+                        .map(v -> v.asString().trim())
+                        .orElse("");
+
+                String permissionsCsv = createOpt
+                        .flatMap(o -> o.getOption("permissions"))
+                        .flatMap(opt -> opt.getValue())
+                        .map(v -> v.asString().trim())
+                        .orElse("");
+
+                // TODO: récupérer ces deux valeurs depuis votre contexte si nécessaire
+                long membershipId = evt.getInteraction().getMember()
+                        .map(m -> m.getId().asLong()) // placeholder: à remplacer par votre vrai membershipId
+                        .orElse(-1L);
+                int position = 0; // placeholder: à remplacer selon votre logique
+
+                log.info("Arguments /role create: name='{}', permissions='{}', membershipId={}, position={}",
+                        roleName, permissionsCsv, membershipId, position);
+
+                if (roleName.isBlank() || permissionsCsv.isBlank() || membershipId <= 0) {
+                    return evt.reply()
+                            .withEphemeral(true)
+                            .withContent("Paramètres requis manquants: `name`, `permissions`, `membershipId`.");
+                }
+
+                long guildId = evt.getInteraction().getGuildId().map(Snowflake::asLong).orElse(-1L);
+                if (guildId <= 0) {
+                    return evt.reply().withEphemeral(true).withContent("GuildId invalide.");
+                }
+
+                String base = api.roleCreateUrl(guildId);
+                // Construction de l’URI avec query params attendus par le backend
+                String uri = base
+                        + "?membershipId=" + membershipId
+                        + "&roleName=" + encode(roleName)
+                        + "&position=" + position
+                        + "&permissions=" + encode(permissionsCsv);
+
+                log.info("Appel API rôle: POST {}", uri);
+
+                return evt.deferReply()
+                        .then(
+                                HttpClient.create()
+                                        .post()
+                                        .uri(uri)
+                                        .responseSingle((res, buf) -> {
+                                            int code = res.status().code();
+                                            return buf.asString().defaultIfEmpty("")
+                                                    .flatMap(body -> {
+                                                        if (code >= 200 && code < 300) {
+                                                            return Mono.just(body.isBlank() ? "Rôle créé." : body);
+                                                        } else {
+                                                            return Mono.error(new RuntimeException("HTTP " + code + " — " + shortBody(res, body)));
+                                                        }
+                                                    });
+                                        })
+                                        .flatMapMany(apiResp ->
+                                                Flux.fromIterable(MessageUtils.splitForDiscord("Réponse API : " + apiResp))
+                                        )
+                                        .concatMap(part -> evt.createFollowup().withContent(part))
+                                        .onErrorResume(e -> evt.createFollowup().withContent(
+                                                MessageUtils.splitForDiscord("Erreur lors de la création du rôle : " + e.getMessage())
+                                                        .getFirst()
+                                        ))
+                                        .then()
+                        );
+            }).onErrorResume(e -> {
+                log.error("Erreur handler role : {}", e.getMessage(), e);
+                return Mono.empty();
+            }).then();
+
+
+
+
+            /* ---------- Assemblage final ---------- */
+
             Mono<Void> registerAll = registerTeach
                     .then(registerTranslate)
                     .then(registerSummarize)
-                    .then(registerQa);
+                    .then(registerQa)
+                    .then(registerRole);
 
-            // Puis : lancer tous les handlers "en parallèle"
             Mono<Void> handlers = printOnLogin
                     .and(messages)
                     .and(teachCommand)
                     .and(translateCommand)
                     .and(summarizeCommand)
-                    .and(qaCommand);
+                    .and(qaCommand)
+                    .and(roleCommand);
 
             return registerAll.then(handlers);
 
         }).block();
+    }
+
+    private static String encode(String v) {
+        try {
+            return java.net.URLEncoder.encode(v, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return v;
+        }
+    }
+    private static String shortBody(reactor.netty.http.client.HttpClientResponse res, String body) {
+        String ct = res.responseHeaders().get("Content-Type", "");
+        if (ct != null && ct.contains("html")) return "réponse HTML (masquée)";
+        return body.length() > 300 ? body.substring(0, 300) + "...(tronqué)" : body;
     }
 }
