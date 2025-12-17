@@ -20,6 +20,10 @@ public class ApiConfig {
         return baseUrl + "/guilds/discord/" + discordId + "/roles";
     }
 
+    public String refreshGuildUrl(long discordId) {
+        return baseUrl + "/guilds/discord/" + discordId + "/refresh";
+    }
+
     private static String normalizeBase(String url) {
         return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
     }

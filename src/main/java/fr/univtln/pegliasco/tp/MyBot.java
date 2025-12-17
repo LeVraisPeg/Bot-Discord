@@ -1,14 +1,21 @@
 package fr.univtln.pegliasco.tp;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import discord4j.core.DiscordClient;
 import discord4j.core.event.domain.interaction.ChatInputInteractionEvent;
 import discord4j.core.event.domain.lifecycle.ReadyEvent;
 import discord4j.core.event.domain.message.MessageCreateEvent;
+import discord4j.core.object.entity.Guild;
+import discord4j.core.object.entity.Member;
 import discord4j.core.object.entity.Message;
 import discord4j.core.object.entity.User;
 import discord4j.common.util.Snowflake;
 import discord4j.discordjson.json.ApplicationCommandOptionData;
 import discord4j.discordjson.json.ApplicationCommandRequest;
+import discord4j.gateway.intent.Intent;
+import discord4j.gateway.intent.IntentSet;
 import io.github.cdimascio.dotenv.Dotenv;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -28,6 +35,7 @@ public class MyBot {
 
     private static final Logger log = LoggerFactory.getLogger(MyBot.class);
     private static final Map<Long, List<String>> CHANNEL_DOCUMENTS = new ConcurrentHashMap<>();
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     public static void main(String[] args) {
         Dotenv dotenv = Dotenv.load();
@@ -38,7 +46,16 @@ public class MyBot {
 
         OllamaClient ollama = new OllamaClient(api.ollamaUrl());
 
-        client.withGateway(gateway -> {
+
+
+        client.gateway()
+                .setEnabledIntents(IntentSet.of(
+                        Intent.GUILDS,
+                        Intent.GUILD_MEMBERS,
+                        Intent.GUILD_MESSAGES,
+                        Intent.MESSAGE_CONTENT
+                ))
+                .withGateway(gateway -> {
             Snowflake selfId = gateway.getSelfId();
 
             HttpClient httpClient = HttpClient.create();
@@ -51,6 +68,38 @@ public class MyBot {
                                     evt.getSelf().getUsername(),
                                     evt.getSelf().getDiscriminator()))
             ).then();
+
+            /*----------  /refresh ---------- */
+            ApplicationCommandRequest refreshCmd = ApplicationCommandRequest.builder()
+                    .name("refresh")
+                    .description("Envoie au backend toutes les infos de la guilde (rôles, membres...).")
+                    .build();
+
+            Mono<Void> registerRefresh = applicationIdMono
+                    .flatMap(appId ->
+                            gateway.getRestClient().getApplicationService()
+                                    .getGlobalApplicationCommands(appId)
+                                    .collectList()
+                                    .flatMap(existing -> {
+                                        boolean hasRefresh = existing.stream()
+                                                .anyMatch(cmd -> "refresh".equalsIgnoreCase(cmd.name()));
+                                        if (hasRefresh) {
+                                            log.info("Commande globale /refresh déjà enregistrée.");
+                                            return Mono.empty();
+                                        }
+                                        log.info("Enregistrement de la commande globale /refresh...");
+                                        return gateway.getRestClient().getApplicationService()
+                                                .createGlobalApplicationCommand(appId, refreshCmd)
+                                                .doOnSuccess(cmd ->
+                                                        log.info("Commande globale /refresh enregistrée (id={})", cmd.id()))
+                                                .then();
+                                    })
+                    )
+                    .onErrorResume(e -> {
+                        log.error("Erreur lors de l'enregistrement de /refresh : {}", e.getMessage(), e);
+                        return Mono.empty();
+                    });
+
 
             /* ---------- /teach ---------- */
 
@@ -357,7 +406,87 @@ public class MyBot {
                     })
                     .then();
 
-            /* ---------- /teach handler ---------- */
+
+            /* ---------- /refresh handler ---------- */
+
+            Mono<Void> refreshCommand = gateway.on(ChatInputInteractionEvent.class, evt -> {
+                if (!"refresh".equalsIgnoreCase(evt.getCommandName())) {
+                    return Mono.empty();
+                }
+
+                log.info("Interaction /refresh reçue");
+
+                var optMember = evt.getInteraction().getMember();
+                if (optMember.isEmpty()) {
+                    return evt.reply()
+                            .withEphemeral(true)
+                            .withContent("Impossible de déterminer la guilde.");
+                }
+
+                Member member = optMember.get();
+                Snowflake guildIdSnowflake = member.getGuildId();
+                long guildId = guildIdSnowflake.asLong();
+
+                log.info("Refresh demandé pour la guilde {}", guildId);
+
+                return evt.deferReply()
+                        .then(
+                                gateway.getGuildById(guildIdSnowflake)
+                                        .flatMap(guild -> buildGuildSnapshot(gateway, guild))
+                                        .flatMap(json -> {
+                                            String uri = api.refreshGuildUrl(guildId);
+                                            log.info("POST refresh vers {}", uri);
+                                            byte[] bytes;
+                                            try {
+                                                bytes = MAPPER.writeValueAsBytes(json);
+                                            } catch (Exception e) {
+                                                return Mono.error(e);
+                                            }
+                                            return HttpClient.create()
+                                                    .post()
+                                                    .uri(uri)
+                                                    .send(Mono.just(
+                                                            Unpooled.wrappedBuffer(bytes)
+                                                    ))
+                                                    .responseSingle((res, buf) -> {
+                                                        int code = res.status().code();
+                                                        return buf.asString().defaultIfEmpty("")
+                                                                .flatMap(body -> {
+                                                                    if (code >= 200 && code < 300) {
+                                                                        return Mono.just(body.isBlank()
+                                                                                ? "Refresh effectué."
+                                                                                : body);
+                                                                    } else {
+                                                                        return Mono.error(new RuntimeException(
+                                                                                "HTTP " + code + " — " + shortBody(res, body)
+                                                                        ));
+                                                                    }
+                                                                });
+                                                    });
+                                        })
+                                        .flatMapMany(apiResp ->
+                                                Flux.fromIterable(
+                                                        MessageUtils.splitForDiscord("Réponse API : " + apiResp)
+                                                )
+                                        )
+                                        .concatMap(part -> evt.createFollowup().withContent(part))
+                                        .onErrorResume(e -> {
+                                            log.error("Erreur /refresh : {}", e.getMessage(), e);
+                                            return Flux.empty();
+                                        })
+
+                                        .then()
+                        );
+                    })
+                    .onErrorResume(e -> {
+                        log.error("Erreur handler refresh : {}", e.getMessage(), e);
+                        return Mono.empty();
+                    })
+                    .then();
+
+
+
+                /* ---------- /teach handler ---------- */
 
             Mono<Void> teachCommand = gateway.on(ChatInputInteractionEvent.class, evt -> {
                         if (!"teach".equalsIgnoreCase(evt.getCommandName())) {
@@ -640,7 +769,8 @@ public class MyBot {
                     .then(registerTranslate)
                     .then(registerSummarize)
                     .then(registerQa)
-                    .then(registerRole);
+                    .then(registerRole)
+                    .then(registerRefresh);
 
             Mono<Void> handlers = printOnLogin
                     .and(messages)
@@ -648,12 +778,76 @@ public class MyBot {
                     .and(translateCommand)
                     .and(summarizeCommand)
                     .and(qaCommand)
-                    .and(roleCommand);
+                    .and(roleCommand)
+                    .and(refreshCommand);
 
             return registerAll.then(handlers);
 
         }).block();
     }
+
+
+    private static Mono<ObjectNode> buildGuildSnapshot(discord4j.core.GatewayDiscordClient gateway, Guild guild) {
+        ObjectNode root = MAPPER.createObjectNode();
+
+        root.put("id", guild.getId().asLong());
+        root.put("name", guild.getName());
+
+        ArrayNode rolesArr = MAPPER.createArrayNode();
+        ArrayNode membersArr = MAPPER.createArrayNode();
+
+        // Rôles
+        Mono<Void> rolesMono = guild.getRoles()
+                .sort((r1, r2) -> Integer.compare(r1.getRawPosition(), r2.getRawPosition()))
+                .doOnNext(role -> {
+                    ObjectNode r = rolesArr.addObject();
+                    r.put("id", role.getId().asLong());
+                    r.put("name", role.getName());
+                    r.put("color", role.getColor().getRGB());
+                    r.put("position", role.getRawPosition());
+                    r.put("permissions", role.getPermissions().getRawValue());
+                    r.put("mentionable", role.isMentionable());
+                })
+                .then();
+
+        // Membres
+        Mono<Void> membersMono = guild.getMembers()
+                .doOnNext(m -> {
+                    ObjectNode mNode = membersArr.addObject();
+                    mNode.put("id", m.getId().asLong());
+                    mNode.put("username", m.getUsername());
+                    mNode.put("discriminator", m.getDiscriminator());
+                    mNode.put("displayName", m.getDisplayName());
+                    ArrayNode rolesIds = mNode.putArray("roleIds");
+                    m.getRoleIds().forEach(r -> rolesIds.add(r.asLong()));
+                    m.getJoinTime().ifPresent(jt -> mNode.put("joinedAt", jt.toString()));
+                })
+                .then();
+
+        // OwnerId (peut être vide)
+        Mono<Long> ownerMono = guild.getOwner()
+                .map(discord4j.core.object.entity.Member::getId)
+                .map(Snowflake::asLong)
+                .onErrorResume(e -> {
+                    log.warn("Impossible de récupérer l'owner de la guilde {} : {}",
+                            guild.getId().asLong(), e.getMessage());
+                    return Mono.empty();
+                });
+
+        // On attend les rôles + membres, puis on ajoute éventuellement ownerId
+        return Mono.when(rolesMono, membersMono)
+                .then(
+                        ownerMono
+                                .doOnNext(ownerId -> root.put("ownerId", ownerId))
+                                .defaultIfEmpty(-1L) // juste pour déclencher la chaîne, valeur ignorée
+                                .then(Mono.fromCallable(() -> {
+                                    root.set("roles", rolesArr);
+                                    root.set("members", membersArr);
+                                    return root;
+                                }))
+                );
+    }
+
 
     private static String encode(String v) {
         try {
