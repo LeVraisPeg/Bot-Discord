@@ -674,91 +674,91 @@ public class MyBot {
                     .then();
 
             /* ---------- /role handler ---------- */
-            Mono<Void> roleCommand = gateway.on(ChatInputInteractionEvent.class, evt -> {
-                if (!"role".equalsIgnoreCase(evt.getCommandName())) {
-                    return Mono.empty();
-                }
 
-                log.info("Interaction /role reçue");
+                    Mono<Void> roleCommand = gateway.on(ChatInputInteractionEvent.class, evt -> {
+                        if (!"role".equalsIgnoreCase(evt.getCommandName())) {
+                            return Mono.empty();
+                        }
 
-                var createOpt = evt.getOption("create");
-                if (createOpt.isEmpty()) {
-                    log.info("Sous-commande /role create absente");
-                    return Mono.empty();
-                }
+                        log.info("Interaction /role reçue");
 
-                String roleName = createOpt
-                        .flatMap(o -> o.getOption("name"))
-                        .flatMap(opt -> opt.getValue())
-                        .map(v -> v.asString().trim())
-                        .orElse("");
+                        var createOpt = evt.getOption("create");
+                        if (createOpt.isEmpty()) {
+                            log.info("Sous-commande /role create absente");
+                            return Mono.empty();
+                        }
 
-                String permissionsCsv = createOpt
-                        .flatMap(o -> o.getOption("permissions"))
-                        .flatMap(opt -> opt.getValue())
-                        .map(v -> v.asString().trim())
-                        .orElse("");
+                        String roleName = createOpt
+                                .flatMap(o -> o.getOption("name"))
+                                .flatMap(opt -> opt.getValue())
+                                .map(v -> v.asString().trim())
+                                .orElse("");
 
-                // TODO: récupérer ces deux valeurs depuis votre contexte si nécessaire
-                long membershipId = evt.getInteraction().getMember()
-                        .map(m -> m.getId().asLong()) // placeholder: à remplacer par votre vrai membershipId
-                        .orElse(-1L);
-                int position = 0; // placeholder: à remplacer selon votre logique
+                        String permissionsCsv = createOpt
+                                .flatMap(o -> o.getOption("permissions"))
+                                .flatMap(opt -> opt.getValue())
+                                .map(v -> v.asString().trim())
+                                .orElse("");
 
-                log.info("Arguments /role create: name='{}', permissions='{}', membershipId={}, position={}",
-                        roleName, permissionsCsv, membershipId, position);
+                        // \*Remplacement membershipId -> userDiscordId\*
+                        long userDiscordId = evt.getInteraction().getUser().getId().asLong();
+                        int position = 0; // à adapter selon ta logique
 
-                if (roleName.isBlank() || permissionsCsv.isBlank() || membershipId <= 0) {
-                    return evt.reply()
-                            .withEphemeral(true)
-                            .withContent("Paramètres requis manquants: `name`, `permissions`, `membershipId`.");
-                }
+                        log.info("Arguments /role create: name='{}', permissions='{}', userDiscordId={}, position={}",
+                                roleName, permissionsCsv, userDiscordId, position);
 
-                long guildId = evt.getInteraction().getGuildId().map(Snowflake::asLong).orElse(-1L);
-                if (guildId <= 0) {
-                    return evt.reply().withEphemeral(true).withContent("GuildId invalide.");
-                }
+                        if (roleName.isBlank() || permissionsCsv.isBlank()) {
+                            return evt.reply()
+                                    .withEphemeral(true)
+                                    .withContent("Paramètres requis manquants: `name` et `permissions`.");
+                        }
 
-                String base = api.roleCreateUrl(guildId);
-                // Construction de l’URI avec query params attendus par le backend
-                String uri = base
-                        + "?membershipId=" + membershipId
-                        + "&roleName=" + encode(roleName)
-                        + "&position=" + position
-                        + "&permissions=" + encode(permissionsCsv);
+                        long guildId = evt.getInteraction().getGuildId().map(Snowflake::asLong).orElse(-1L);
+                        if (guildId <= 0) {
+                            return evt.reply().withEphemeral(true).withContent("GuildId invalide.");
+                        }
 
-                log.info("Appel API rôle: POST {}", uri);
+                        String base = api.roleCreateUrl(guildId);
+                        // \*On envoie maintenant userDiscordId en query param\*
+                        String uri = base
+                                + "?userDiscordId=" + userDiscordId
+                                + "&roleName=" + encode(roleName)
+                                + "&position=" + position
+                                + "&permissions=" + encode(permissionsCsv);
 
-                return evt.deferReply()
-                        .then(
-                                HttpClient.create()
-                                        .post()
-                                        .uri(uri)
-                                        .responseSingle((res, buf) -> {
-                                            int code = res.status().code();
-                                            return buf.asString().defaultIfEmpty("")
-                                                    .flatMap(body -> {
-                                                        if (code >= 200 && code < 300) {
-                                                            return Mono.just(body.isBlank() ? "Rôle créé." : body);
-                                                        } else {
-                                                            return Mono.error(new RuntimeException("HTTP " + code + " — " + shortBody(res, body)));
-                                                        }
-                                                    });
-                                        })
-                                        .flatMapMany(apiResp ->
-                                                Flux.fromIterable(MessageUtils.splitForDiscord("Réponse API : " + apiResp))
-                                        )
-                                        .concatMap(part -> evt.createFollowup().withContent(part))
-                                        .onErrorResume(e -> evt.createFollowup().withContent(
-                                                MessageUtils.splitForDiscord("Erreur lors de la création du rôle : " + e.getMessage())
-                                                        .getFirst()
-                                        ))
-                                        .then()
-                        );
-            }).onErrorResume(e -> {
-                log.error("Erreur handler role : {}", e.getMessage(), e);
-                return Mono.empty();
-            }).then();
+                        log.info("Appel API rôle: POST {}", uri);
+
+                        return evt.deferReply()
+                                .then(
+                                        HttpClient.create()
+                                                .post()
+                                                .uri(uri)
+                                                .responseSingle((res, buf) -> {
+                                                    int code = res.status().code();
+                                                    return buf.asString().defaultIfEmpty("")
+                                                            .flatMap(body -> {
+                                                                if (code >= 200 && code < 300) {
+                                                                    return Mono.just(body.isBlank() ? "Rôle créé." : body);
+                                                                } else {
+                                                                    return Mono.error(new RuntimeException("HTTP " + code + " — " + shortBody(res, body)));
+                                                                }
+                                                            });
+                                                })
+                                                .flatMapMany(apiResp ->
+                                                        Flux.fromIterable(MessageUtils.splitForDiscord("Réponse API : " + apiResp))
+                                                )
+                                                .concatMap(part -> evt.createFollowup().withContent(part))
+                                                .onErrorResume(e -> evt.createFollowup().withContent(
+                                                        MessageUtils.splitForDiscord("Erreur lors de la création du rôle : " + e.getMessage())
+                                                                .getFirst()
+                                                ))
+                                                .then()
+                                );
+                    }).onErrorResume(e -> {
+                        log.error("Erreur handler role : {}", e.getMessage(), e);
+                        return Mono.empty();
+                    }).then();
+
 
 
 
