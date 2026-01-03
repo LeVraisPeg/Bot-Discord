@@ -416,6 +416,9 @@ public class MyBot {
 
                 log.info("Interaction /refresh reçue");
 
+                long interactionId = evt.getInteraction().getId().asLong();
+                log.info("Interaction /refresh reçue, interactionId={}", interactionId);
+
                 var optMember = evt.getInteraction().getMember();
                 if (optMember.isEmpty()) {
                     return evt.reply()
