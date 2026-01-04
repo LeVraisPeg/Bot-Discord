@@ -703,7 +703,6 @@ public class MyBot {
                                 .map(v -> v.asString().trim())
                                 .orElse("");
 
-                        // \*Remplacement membershipId -> userDiscordId\*
                         long userDiscordId = evt.getInteraction().getUser().getId().asLong();
                         int position = 0; // à adapter selon ta logique
 
@@ -718,24 +717,45 @@ public class MyBot {
 
                         long guildId = evt.getInteraction().getGuildId().map(Snowflake::asLong).orElse(-1L);
                         if (guildId <= 0) {
-                            return evt.reply().withEphemeral(true).withContent("GuildId invalide.");
+                            return evt.reply()
+                                    .withEphemeral(true)
+                                    .withContent("Impossible de déterminer la guilde.");
                         }
 
-                        String base = api.roleCreateUrl(guildId);
-                        // \*On envoie maintenant userDiscordId en query param\*
-                        String uri = base
-                                + "?userDiscordId=" + userDiscordId
-                                + "&roleName=" + encode(roleName)
-                                + "&position=" + position
-                                + "&permissions=" + encode(permissionsCsv);
+                        String uri = api.roleCreateUrl(guildId);
 
                         log.info("Appel API rôle: POST {}", uri);
+
+                        ObjectNode json = MAPPER.createObjectNode();
+                        json.put("userDiscordId", userDiscordId);
+                        json.put("roleName", roleName);
+                        json.put("position", position);
+
+                        // Transformer la chaîne CSV de permissions en tableau JSON de strings
+                        ArrayNode permsArray = json.putArray("permissions");
+                        for (String perm : permissionsCsv.split(",")) {
+                            String name = perm.trim();
+                            if (!name.isEmpty()) {
+                                permsArray.add(name);
+                            }
+                        }
+
+                        byte[] bytes;
+                        try {
+                            bytes = MAPPER.writeValueAsBytes(json);
+                        } catch (Exception e) {
+                            log.error("Erreur sérialisation JSON pour /role : {}", e.getMessage(), e);
+                            return evt.reply()
+                                    .withEphemeral(true)
+                                    .withContent("Erreur interne lors de la préparation de la requête rôle.");
+                        }
 
                         return evt.deferReply()
                                 .then(
                                         HttpClient.create()
                                                 .post()
                                                 .uri(uri)
+                                                .send(Mono.just(Unpooled.wrappedBuffer(bytes)))
                                                 .responseSingle((res, buf) -> {
                                                     int code = res.status().code();
                                                     return buf.asString().defaultIfEmpty("")
