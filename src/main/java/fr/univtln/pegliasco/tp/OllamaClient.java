@@ -17,6 +17,12 @@ public class OllamaClient {
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(5);
     private static final Duration RESPONSE_TIMEOUT = Duration.ofSeconds(120);
 
+    /**
+     * Limite max (en chars) pour le champ JSON `message` côté backend.
+     * L'erreur observée indique une contrainte à 2000.
+     */
+    private static final int BACKEND_MESSAGE_LIMIT = 2000;
+
     private final ObjectMapper mapper;
     private final HttpClient client;
     private final String apiUrl;
@@ -51,12 +57,14 @@ public class OllamaClient {
         String payload = buildPayload(instruction, "teach");
         return send(payload).flatMap(this::extractText).timeout(RESPONSE_TIMEOUT);
     }
+
     // Prompt dédié pour /translate
     public Mono<String> generateTranslation(String text) {
         String instruction = "Traduis le texte suivant en français de manière fluide et naturelle:\n\"" + text + "\"";
         String payload = buildPayload(instruction, "translate");
         return send(payload).flatMap(this::extractText).timeout(RESPONSE_TIMEOUT);
     }
+
     // Prompt dédié pour /summarize
     public Mono<String> generateSummary(String text) {
         String instruction = "Fais un résumé concis et clair du texte suivant en français:\n\"" + text + "\"";
@@ -79,7 +87,7 @@ public class OllamaClient {
                 .uri(apiUrl)
                 .send(ByteBufFlux.fromString(Mono.just(payload)))
                 .responseSingle((res, content) ->
-                        content.asString().flatMap(body -> {
+                        content.asString().defaultIfEmpty("").flatMap(body -> {
                             int code = res.status().code();
                             if (code < 200 || code >= 300) {
                                 System.err.println("HTTP " + code + " - Corps: " + truncate(body, 512));
@@ -110,7 +118,16 @@ public class OllamaClient {
     private String buildPayload(String userMessage, String mode) {
         try {
             ObjectNode root = mapper.createObjectNode();
-            root.put("message", userMessage);
+
+            // Le backend applique une contrainte (observée) à 2000 chars sur `message`.
+            // On tronque ici pour éviter un HTTP 400 et on garde un suffixe explicite.
+            String safeMessage = MessageUtils.truncateSafe(
+                    userMessage,
+                    BACKEND_MESSAGE_LIMIT,
+                    "\n...[tronqué par le bot]"
+            );
+
+            root.put("message", safeMessage);
             if (mode != null) {
                 root.put("mode", mode);
             }

@@ -9,6 +9,36 @@ public final class MessageUtils {
 
     private MessageUtils() {}
 
+    public static int discordLimit() {
+        return DISCORD_LIMIT;
+    }
+
+    /**
+     * Tronque le texte à {@code maxChars} (en caractères Java), ajoute un suffixe si tronqué,
+     * et évite de casser une paire surrogée (emoji, etc.).
+     */
+    public static String truncateSafe(String text, int maxChars, String truncatedSuffix) {
+        if (text == null) return "";
+        if (maxChars <= 0) return "";
+
+        String suffix = truncatedSuffix == null ? "" : truncatedSuffix;
+        if (text.length() <= maxChars) return text;
+
+        int end = Math.max(0, maxChars - suffix.length());
+        end = Math.min(end, text.length());
+
+        if (end > 0 && end < text.length() && Character.isLowSurrogate(text.charAt(end - 1))) {
+            end--;
+        }
+
+        if (end <= 0) {
+            // Limite trop petite: on renvoie uniquement le suffixe (tronqué si besoin)
+            return suffix.length() <= maxChars ? suffix : suffix.substring(0, maxChars);
+        }
+
+        return text.substring(0, end) + suffix;
+    }
+
     public static List<String> splitForDiscord(String text) {
         List<String> parts = new ArrayList<>();
         if (text == null || text.isEmpty()) return parts;
@@ -20,18 +50,18 @@ public final class MessageUtils {
             int hardEnd = Math.min(start + DISCORD_LIMIT, n);
             int cut;
 
-            // 🔹 Si c'est le DERNIER chunk, on envoie tout (pas besoin de chercher un joli cut)
+            // Si c'est le DERNIER chunk, on envoie tout
             if (hardEnd == n) {
                 cut = n;
             } else {
-                // 🔹 Sinon on cherche un point de coupure "propre" proche de la limite
+                // Sinon on cherche un point de coupure "propre" proche de la limite
                 cut = findBestCut(text, start, hardEnd);
                 if (cut == -1) {
                     cut = hardEnd;
                 }
             }
 
-            // Sécurité anti-emoji (eviter de couper une paire surrogée)
+            // Sécurité anti-emoji (éviter de couper une paire surrogée)
             if (cut < n && cut > start && Character.isLowSurrogate(text.charAt(cut - 1))) {
                 cut--;
             }
