@@ -1,341 +1,336 @@
-# Bot Discord Java - État actuel du projet
+# Bot-Discord (Java)
 
-## 1. Présentation du projet
+Bot Discord en Java (Discord4J) qui :
 
-Ce projet est un bot Discord développé en Java, utilisant l’API Discord via la bibliothèque Discord4J.  
-Le bot communique avec un backend HTTP et un service de génération de texte de type LLM.
+- répond quand on le mentionne (via un service LLM exposé sur une route backend `/ollama`) ;
+- propose des commandes slash d’assistance (`/teach`, `/translate`, `/summarize`, `/qa`) ;
+- propose des commandes slash “backend” (`/role create`, `/refresh`) pour piloter/synchroniser une guilde via HTTP.
 
-### Objectif réel du bot
-
-D’après le code, le bot a pour objectifs concrets :
-
-- Répondre aux messages où il est mentionné en s’appuyant sur un service de génération de texte (`OllamaClient`).
-- Exposer des commandes slash permettant :
-    - de demander une explication de concept technique (`/teach`) ;
-    - de traduire un texte en français (`/translate`) ;
-    - de résumer un texte en français (`/summarize`) ;
-    - de poser une question sur des documents envoyés dans un salon (`/qa`) ;
-    - de créer des rôles Discord via un backend (`/role create`) ;
-    - de synchroniser l’état d’une guilde Discord vers un backend (`/refresh`).
-
-### Cas d’usage effectivement implémentés
-
-Fonctionnalités présentes dans le code :
-
-- Réactions aux messages texte classiques lorsque le bot est mentionné.
-- Indexation des pièces jointes texte envoyées dans un salon, pour un usage ultérieur par `/qa`.
-- Commandes slash globales :
-    - `/teach concept:<string>` : explication technique.
-    - `/translate text:<string>` : traduction vers le français.
-    - `/summarize text:<string>` : résumé en français.
-    - `/qa question:<string>` : question basée sur des documents déjà envoyés dans le salon.
-    - `/role create name:<string> permissions:<string>` : création d’un rôle via appel HTTP à un backend.
-    - `/refresh` : envoi d’un instantané de la guilde au backend.
-
-### Rôle du bot dans le système global
-
-- Interface Discord entre les utilisateurs et :
-    - un service HTTP de type LLM pour la génération de texte (`OllamaClient`) ;
-    - un backend applicatif pour la gestion de rôles et la synchronisation de guildes (`/role`, `/refresh`).
-- Point central de collecte de données Discord (rôles, membres, documents de salon) pour les transmettre au backend.
+Le projet est construit avec Maven et cible **Java 21**.
 
 ---
 
-## 2. Organisation actuelle du code
+## Sommaire
 
-### Structure réelle des packages
-
-Le code montré est contenu dans le package principal :
-
-- `fr.univtln.pegliasco.tp`
-
-Les classes visibles :
-
-- `MyBot`
-- `ApiConfig`
-- `MessageUtils`
-- `OllamaClient`
-
-### Responsabilités des principales classes
-
-- `MyBot`
-    - Classe principale contenant la méthode `main`.
-    - Initialise le client Discord et configure les intents.
-    - Instancie la configuration API et le client `OllamaClient`.
-    - Enregistre les commandes slash globales.
-    - Définit et branche tous les handlers d’événements (messages, interactions slash).
-    - Gère la logique métier directement à l’intérieur des handlers.
-
-- `ApiConfig`
-    - Lit la configuration depuis l’environnement (`Dotenv`).
-    - Construit l’URL de base du backend, avec une valeur par défaut `http://localhost:8080` si la variable d’environnement `BACKEND_BASE_URL` est absente ou vide.
-    - Fournit des méthodes d’assemblage d’URL pour :
-        - le service LLM (`ollamaUrl`) ;
-        - l’API de création de rôles (`roleCreateUrl`) ;
-        - l’API de rafraîchissement de guilde (`refreshGuildUrl`).
-
-- `MessageUtils`
-    - Découpe une chaîne longue en segments respectant la limite de 2000 caractères de Discord.
-    - Recherche des points de coupure "propres" (sauts de ligne, espaces) et évite de couper au milieu de paires de surrogates (emojis).
-    - Fournit une méthode d’échappement minimal de certains caractères Markdown pour limiter les effets de mise en forme dans Discord.
-
-- `OllamaClient`
-    - Client HTTP pour un service de génération de texte externe.
-    - Construit et envoie des requêtes JSON à une URL fournie (mode générique et modes spécialisés).
-    - Propose des méthodes dédiées :
-        - `generate` (message libre) ;
-        - `generateTeaching` (prompt adapté à `/teach`) ;
-        - `generateTranslation` (prompt adapté à `/translate`) ;
-        - `generateSummary` (prompt adapté à `/summarize`) ;
-        - `generateQA` (prompt adapté à `/qa`).
-    - Parse la réponse JSON pour extraire un champ textuel (`response`, `message` ou `content`), avec une logique de repli sur le corps brut.
-
-### Couplage actuel entre commandes Discord et logique métier
-
-- Les handlers de commandes slash sont définis directement dans `MyBot` et appellent immédiatement les méthodes de `OllamaClient` ou du client HTTP bas niveau.
-- La construction des prompts, l’échappement Markdown et la découpe des messages sont effectués dans `MyBot` en combinant directement `OllamaClient` et `MessageUtils`.
-- Les appels au backend (rôles, refresh guilde, téléchargement de pièces jointes) sont réalisés directement dans `MyBot` via `HttpClient` sans couche de service intermédiaire.
+- [Fonctionnalités](#fonctionnalités)
+- [Stack & dépendances](#stack--dépendances)
+- [Architecture du code](#architecture-du-code)
+- [Prérequis](#prérequis)
+- [Configuration](#configuration)
+- [Lancer le bot](#lancer-le-bot)
+- [Commandes / utilisation](#commandes--utilisation)
+- [Backend attendu (contrat HTTP)](#backend-attendu-contrat-http)
+- [Limitations & comportements](#limitations--comportements)
+- [Développement](#développement)
+- [Dépannage](#dépannage)
 
 ---
 
-## 3. Gestion des commandes Discord
+## Fonctionnalités
 
-### Librairie Discord réellement utilisée
+### 1) Réponse aux mentions
 
-- Bibliothèque principale : `discord4j`  
-  Utilisation des éléments suivants :
-    - `DiscordClient`
-    - `GatewayDiscordClient`
-    - Événements :
-        - `ReadyEvent`
-        - `MessageCreateEvent`
-        - `ChatInputInteractionEvent`
-    - Modèles Discord : `Guild`, `Member`, `Message`, `User`, `Snowflake`
-    - Types de commandes : `ApplicationCommandRequest`, `ApplicationCommandOptionData`
+- Lorsqu’un message contient une mention du bot (`<@id>`), le bot enlève la mention et envoie le texte au service LLM.
+- La réponse est **échappée** (anti-markdown) et **découpée** en morceaux de 2000 caractères (limite Discord) avant envoi.
 
-### Mode de gestion des événements et commandes
+### 2) Indexation de fichiers texte (pour `/qa`)
 
-- Connexion via `DiscordClient.create(token)` puis `client.gateway().withGateway(...)`.
-- Enregistrement des listeners d’événements sur le `GatewayDiscordClient` via `gateway.on(EventType.class, handler)`.
-- Enregistrement des commandes slash globales à chaque démarrage via l’API REST Discord4J (`getApplicationService().createGlobalApplicationCommand`), après vérification de leur existence.
+- Quand un message contient des pièces jointes de type `text/*`, le bot télécharge leur contenu et l’indexe en mémoire par salon.
+- La commande `/qa` s’appuie sur ces documents indexés comme contexte.
 
-### Flux actuel de traitement d’une commande
+### 3) Commandes slash “LLM”
 
-Exemple de flux générique pour une commande slash (`/teach`, `/translate`, `/summarize`, `/qa`, `/role`, `/refresh`) :
+- `/teach concept:<string>` : explication pédagogique d’un concept
+- `/translate text:<string>` : traduction en français
+- `/summarize text:<string>` : résumé en français
+- `/qa question:<string>` : Q/R basée sur les documents indexés dans le salon
 
-1. Réception d’un `ChatInputInteractionEvent`.
-2. Vérification du nom de la commande (`evt.getCommandName()`).
-3. Extraction des options via `evt.getOption(...)` et `getValue().asString()`.
-4. Vérifications simples (présence de texte, guilde valide, permissions passées en paramètre, etc.).
-5. `evt.deferReply()` pour indiquer au client Discord que la réponse est en cours de préparation.
-6. Appel à :
-    - `OllamaClient` pour les commandes `/teach`, `/translate`, `/summarize`, `/qa`, ou
-    - `HttpClient.create().post()` / `HttpClient.create().get()` pour les appels backend et téléchargements de fichiers.
-7. Post‑traitement de la réponse :
-    - Échappement Markdown via `MessageUtils.escapeDiscordMarkdown` pour les contenus générés.
-    - Découpage en segments de ≤ 2000 caractères via `MessageUtils.splitForDiscord`.
-8. Envoi des réponses sous forme de followups (`evt.createFollowup().withContent(part)`).
+### 4) Commandes slash “backend”
 
-Pour les messages classiques :
-
-1. Réception d’un `MessageCreateEvent`.
-2. Indexation éventuelle des pièces jointes texte du message.
-3. Ignorance des messages du bot lui‑même et des messages dont le contenu ressemble à du JSON brut (commençant par `{`).
-4. Vérification que le bot est mentionné dans le message.
-5. Nettoyage du message (suppression de la mention du bot).
-6. Appel à `ollama.generate(...)`, échappement, découpe, puis réponse dans le même salon.
+- `/role create name:<string> permissions:<csv>` : appelle le backend pour créer un rôle
+- `/refresh` : envoie au backend un “snapshot” de la guilde (rôles, membres, ownerId…)
 
 ---
 
-## 4. Communication avec le service backend
+## Stack & dépendances
 
-### Type de communication réellement implémentée
+Déclarées dans `pom.xml` :
 
-- Communication HTTP de type REST, avec des requêtes `POST` et `GET` sur des URLs construites à partir d’`ApiConfig`.
-- Corps JSON pour certains appels (`/refresh`, service LLM).
+- **Java 21** (source/target 21)
+- **Discord4J** `com.discord4j:discord4j-core:3.2.9`
+- **Reactor Netty** `io.projectreactor.netty:reactor-netty-http:1.3.0-RC1` (client HTTP)
+- **Jackson** `com.fasterxml.jackson.core:jackson-databind:2.18.2` (JSON)
+- **dotenv** `io.github.cdimascio:java-dotenv:5.2.2` (variables `.env`)
+- **slf4j** `slf4j-api` + `slf4j-simple` (logs)
+- **JUnit 5** (tests)
 
-### Client HTTP utilisé
-
-- `reactor.netty.http.client.HttpClient` est utilisé pour :
-    - Les appels au backend pour `/role create` et `/refresh`.
-    - Le téléchargement de pièces jointes depuis les URLs fournies par Discord.
-- `OllamaClient` encapsule également un `HttpClient` configuré spécifiquement pour le service de génération de texte.
-
-### Gestion actuelle des erreurs et du temps de réponse
-
-- Dans `OllamaClient` :
-    - Timeout de connexion paramétré à 5 secondes.
-    - Timeout de réponse paramétré à 120 secondes.
-    - Si le code HTTP n’est pas 2xx, une erreur est propagée avec un message `HTTP <code>` et le corps tronqué dans les logs.
-    - Si la réponse JSON ne contient pas les champs attendus, le corps brut est renvoyé si non vide, sinon une erreur `Réponse vide` est produite.
-
-- Dans `MyBot` :
-    - De nombreux appels HTTP effectuent un `onErrorResume` qui logue l’erreur et renvoie un message générique vers Discord (par exemple : *"Erreur interne lors de l'appel au modèle."*, *"Erreur lors de l'explication du concept."*, etc.).
-    - Pour `/role` et `/refresh`, si le code HTTP n’est pas 2xx, une exception est créée avec le code et un extrait du corps (`shortBody`), puis remontée jusqu’au handler, qui renvoie un message d’erreur textuel au client Discord.
-    - Les erreurs dans les handlers d’événements sont loguées et généralement absorbées, pour éviter l’arrêt du flux.
+Assemblage : `maven-assembly-plugin` produit un `jar-with-dependencies` dont la classe main est `fr.univtln.pegliasco.tp.MyBot`.
 
 ---
 
-## 5. Stack technique effective
+## Architecture du code
 
-### Version de Java
+Package principal : `fr.univtln.pegliasco.tp`
 
-- La version exacte de Java est déterminée dans le `pom.xml` (non affiché ici), mais le code utilise des fonctionnalités compatibles avec Java 11+ (API HTTP Netty, `var` absent, `record` absent, `switch` classique).
-- Le code montré est écrit de manière compatible avec une version Java standard moderne, sans utilisation d’APIs spécifiques à une version très récente.
-
-### Dépendances Maven réellement présentes (à partir du code observé)
-
-Les dépendances utilisées dans le code (présumées présentes dans le `pom.xml`) sont :
-
-- `discord4j-core` (Discord4J)
-- `discord4j-discordjson` (types `ApplicationCommandRequest`, `ApplicationCommandOptionData`)
-- `reactor-core` (types `Mono`, `Flux`)
-- `reactor-netty` (types `HttpClient`, `ByteBufFlux`, `ChannelOption`)
-- `jackson-databind` (types `ObjectMapper`, `JsonNode`, `ObjectNode`, `ArrayNode`)
-- `dotenv-java` (`io.github.cdimascio.dotenv.Dotenv`)
-- `slf4j-api` et une implémentation de logging compatible (utilisation de `LoggerFactory`)
-
-### Frameworks ou bibliothèques effectivement utilisés
-
-- Discord4J pour l’intégration avec Discord.
-- Jackson pour la sérialisation/désérialisation JSON.
-- Reactor Netty pour le client HTTP.
-- Dotenv pour la configuration par variables d’environnement.
-- SLF4J pour les logs.
+- `MyBot` : point d’entrée (`main`).
+  - initialise la gateway Discord + intents
+  - enregistre les commandes slash globales au démarrage
+  - gère les handlers d’événements (messages et interactions)
+  - appelle le backend (`/refresh`, `/role`) et le LLM (via `OllamaClient`)
+- `ApiConfig` : lit la config et construit les URLs backend.
+- `OllamaClient` : client HTTP vers l’endpoint LLM (`/ollama`).
+- `MessageUtils` : utilitaires (split 2000 chars, échappement markdown, troncature “safe”).
 
 ---
 
-## 6. Fonctionnalités existantes
+## Prérequis
 
-### Liste précise des commandes et fonctionnalités implémentées
+- **JDK 21** installé
+- **Maven** (ou wrapper Maven si vous en ajoutez un)
+- Un **bot Discord** créé sur le portail développeur Discord, avec son **token**
+- Un **backend HTTP** accessible (local ou distant) exposant les routes attendues (voir [Backend attendu](#backend-attendu-contrat-http))
 
-- Commandes slash globales :
+### Intents Discord
 
-    - `/teach`
-        - Option obligatoire : `concept` (string).
-        - Envoie un prompt de type explication technique au service LLM.
-        - Retourne la réponse du modèle, échappée et découpée.
+Le bot active :
 
-    - `/translate`
-        - Option obligatoire : `text` (string).
-        - Envoie un prompt de traduction en français au service LLM.
-        - Retourne la traduction, échappée et découpée.
+- `GUILDS`
+- `GUILD_MEMBERS`
+- `GUILD_MESSAGES`
+- `MESSAGE_CONTENT`
 
-    - `/summarize`
-        - Option obligatoire : `text` (string).
-        - Envoie un prompt de résumé en français au service LLM.
-        - Retourne le résumé, échappé et découpé.
-
-    - `/qa`
-        - Option obligatoire : `question` (string).
-        - Construit un contexte à partir des documents texte indexés dans le salon courant (pièces jointes texte précédemment envoyées).
-        - Envoie un prompt de question‑réponse au service LLM.
-        - Retourne la réponse, échappée et découpée.
-        - Si aucun document n’est indexé, renvoie un message éphémère expliquant la situation.
-
-    - `/role create`
-        - Sous‑commande `create` avec options obligatoires :
-            - `name` (string)
-            - `permissions` (string, liste CSV de permissions, interprétée côté backend).
-        - Récupère l’ID Discord de l’utilisateur appelant et l’ID de la guilde.
-        - Appelle le backend via HTTP `POST` sur l’URL configurée, en passant les paramètres en query string.
-        - Retourne la réponse brute de l’API, ou un message générique en cas d’erreur.
-
-    - `/refresh`
-        - Sans option.
-        - Récupère la guilde depuis le contexte de l’interaction, puis construit un instantané JSON :
-            - rôles (id, nom, couleur, position, permissions, mentionnable) ;
-            - membres (id, username, discriminator, displayName, rôle IDs, date d’arrivée) ;
-            - éventuellement `ownerId` si récupérable.
-        - Envoie ce JSON au backend via HTTP `POST`.
-        - Retourne la réponse textuelle de l’API.
-
-- Gestion des messages :
-
-    - Indexation des pièces jointes texte :
-        - Pour chaque `MessageCreateEvent`, le bot télécharge les pièces jointes dont le `contentType` commence par `text/`.
-        - Le contenu est stocké en mémoire dans une `Map<Long, List<String>>` indexée par ID de salon.
-    - Réponse automatique aux mentions :
-        - Si le message mentionne le bot, et n’est pas un JSON brut, le contenu nettoyé est transmis à `ollama.generate`.
-        - La réponse du service est renvoyée dans le salon, après échappement Markdown et découpe.
-
-### Ce qui n’est PAS encore implémenté (d’après le code visible)
-
-- Pas de persistance des documents indexés au‑delà de la mémoire process : tout est stocké dans une `ConcurrentHashMap` en mémoire.
-- Pas de gestion explicite des permissions Discord pour l’exécution des commandes (la logique repose sur l’API backend pour `/role`).
-- Pas de mécanisme interne de rate limiting ou de file d’attente pour les appels au service LLM ou au backend.
-- Pas de configuration avancée des modèles ou des prompts côté bot au‑delà des chaînes codées en dur dans `OllamaClient`.
+Sur le portail Discord Developer, pensez à activer les intents “privileged” si nécessaire (notamment **Message Content Intent** et **Server Members Intent**) selon votre configuration.
 
 ---
 
-## 7. Lancement du bot
+## Configuration
 
-### Prérequis nécessaires
+La config se fait via un fichier `.env` (chargé par `Dotenv.load()` dans `MyBot`).
 
-- JDK installé (version compatible avec le `pom.xml` du projet).
-- Maven installé.
-- Un bot Discord configuré, avec un token valide.
-- Un backend HTTP accessible si l’on veut utiliser :
-    - les commandes `/role` et `/refresh` ;
-    - le service LLM accessible via l’URL fournie.
+### Variables d’environnement
 
-### Configuration requise
+- `DISCORD_TOKEN` (**obligatoire**) : token du bot Discord
+- `BACKEND_BASE_URL` (optionnel) : base URL du backend, défaut `http://localhost:8080`
 
-Variables d’environnement gérées par `Dotenv` :
+`ApiConfig` utilise `BACKEND_BASE_URL` et construit :
 
-- `DISCORD_TOKEN`  
-  Token du bot Discord. Obligatoire pour démarrer le bot.
-- `BACKEND_BASE_URL`  
-  URL de base du backend.  
-  Si non définie ou vide, la valeur par défaut utilisée est `http://localhost:8080`.
+- LLM : `{BACKEND_BASE_URL}/ollama`
+- Rôles : `{BACKEND_BASE_URL}/guilds/discord/{guildId}/roles`
+- Refresh : `{BACKEND_BASE_URL}/guilds/discord/{guildId}/refresh`
 
-À partir de `BACKEND_BASE_URL`, les URLs suivantes sont dérivées :
+### Exemple de `.env`
 
-- `BACKEND_BASE_URL` \+ `/ollama` pour le service LLM.
-- `BACKEND_BASE_URL` \+ `/guilds/discord/{guildDiscordId}/roles` pour `/role`.
-- `BACKEND_BASE_URL` \+ `/guilds/discord/{guildDiscordId}/refresh` pour `/refresh`.
-
-### Commandes Maven réellement fonctionnelles pour démarrer le bot
-
-Sous réserve d’un `pom.xml` Maven standard avec un plugin `exec` ou `spring-boot-maven-plugin` (non affiché ici), les commandes typiques sont :
-
-- Compilation :
-
-```bash
-mvn compile
+```dotenv
+DISCORD_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+BACKEND_BASE_URL=http://localhost:8080
 ```
 
-- Exécution via la classe `main` (avec `exec-maven-plugin` correctement configuré) :
+---
 
-```bash
-mvn exec:java -Dexec.mainClass=fr.univtln.pegliasco.tp.MyBot
+## Lancer le bot
+
+### Option A — Exécuter via Maven
+
+```powershell
+mvn -q test
+mvn -q package
+mvn -q exec:java -Dexec.mainClass="fr.univtln.pegliasco.tp.MyBot"
 ```
 
-Si un autre mécanisme d’exécution est défini dans le `pom.xml`, il doit être utilisé tel qu’il est configuré.
+> Remarque : le projet ne déclare pas le plugin `exec-maven-plugin` dans le `pom.xml`. Sur certaines configs Maven, la dernière commande peut nécessiter d’ajouter le plugin (sinon utilisez l’option B).
+
+### Option B — Exécuter le jar “fat”
+
+Après compilation, Maven produit un jar autonome (avec dépendances) :
+
+- `target/Bot-Discord-1.0-SNAPSHOT-jar-with-dependencies.jar`
+
+Exécution :
+
+```powershell
+java -jar .\target\Bot-Discord-1.0-SNAPSHOT-jar-with-dependencies.jar
+```
 
 ---
 
-## 8. Tests existants
+## Commandes / utilisation
 
-D’après les fichiers fournis :
+### Mention du bot
 
-- Aucun test (unitaire ou d’intégration) n’est visible.
-- Aucun framework de test (par exemple JUnit) n’est observé dans les extraits de code.
-- Aucun code de test n’est présent dans les packages montrés.
+Dans un salon où le bot a accès, mentionnez-le puis écrivez votre message :
+
+- `@MonBot Peux-tu m’expliquer les streams en Java ?`
+
+Le bot envoie le contenu au LLM et répond dans le salon.
+
+### `/teach`
+
+- Paramètre : `concept` (obligatoire)
+- Réponse : explication structurée (définition, utilité, exemple, pièges)
+
+### `/translate`
+
+- Paramètre : `text` (obligatoire)
+- Réponse : traduction en français
+
+### `/summarize`
+
+- Paramètre : `text` (obligatoire)
+- Réponse : résumé en français
+
+### `/qa`
+
+- Paramètre : `question` (obligatoire)
+- Pré-requis : avoir envoyé au moins **un fichier texte** dans ce salon (pièce jointe)
+- Réponse : le bot construit un contexte avec les documents indexés et interroge le LLM.
+
+### `/role create`
+
+- Paramètres :
+  - `name` (obligatoire)
+  - `permissions` (obligatoire) : chaîne CSV (ex: `READ_MESSAGES,SEND_MESSAGES`)
+
+Le bot POST un JSON au backend pour créer un rôle.
+
+### `/refresh`
+
+Envoie un snapshot JSON de la guilde au backend (rôles + membres + ownerId si dispo).
 
 ---
 
-## 9. Limitations actuelles
+## Backend attendu (contrat HTTP)
 
-### Contraintes techniques visibles dans le code
+Le bot ne parle **pas** directement à Ollama : il appelle un **backend** unique à `BACKEND_BASE_URL`, qui expose plusieurs routes.
 
-- Stockage en mémoire des documents indexés (`CHANNEL_DOCUMENTS`) sans mécanisme de nettoyage ni persistance.
-- Les prompts de génération (`teach`, `translate`, `summarize`, `qa`) sont codés en dur dans `OllamaClient`.
-- Dépendance forte à la disponibilité du backend et du service LLM : en cas d’indisponibilité prolongée, les commandes associées ne peuvent pas répondre autrement que par un message d’erreur générique.
-- Le bot repose sur les limites de Discord (notamment 2000 caractères) gérées par une découpe manuelle via `MessageUtils`.
+### 1) POST `/ollama`
 
-### Manques actuels
+Utilisé par `OllamaClient`.
 
-- Absence de tests dans le code observé.
-- Absence de configuration avancée ou externe des prompts et des modèles.
-- Gestion des erreurs principalement basée sur des logs et des messages génériques retournés à l’utilisateur.
+- Requête JSON :
+  - `message` (string) : texte utilisateur **tronqué à 2000 chars** côté bot
+  - `mode` (optionnel) : `teach | translate | summarize | qa`
+
+- Réponse : le bot tente d’extraire le texte depuis l’un de ces champs :
+  - `response` (prioritaire)
+  - sinon `message`
+  - sinon `content`
+  - sinon il renvoie le corps brut
+
+### 2) POST `/guilds/discord/{guildId}/roles`
+
+Utilisé par `/role create`.
+
+Payload envoyé :
+
+```json
+{
+  "userDiscordId": 123456789,
+  "roleName": "MonRole",
+  "position": 0,
+  "permissions": ["READ_MESSAGES", "SEND_MESSAGES"]
+}
+```
+
+Le bot considère `2xx` comme succès, sinon affiche `HTTP <code> — <extrait du corps>`.
+
+### 3) POST `/guilds/discord/{guildId}/refresh`
+
+Utilisé par `/refresh`.
+
+Payload envoyé (schéma indicatif) :
+
+```json
+{
+  "id": 123,
+  "name": "MaGuilde",
+  "ownerId": 456,
+  "roles": [
+    {
+      "id": 1,
+      "name": "Admin",
+      "color": 16711680,
+      "position": 10,
+      "permissions": 123456,
+      "mentionable": true
+    }
+  ],
+  "members": [
+    {
+      "id": 42,
+      "username": "user",
+      "discriminator": "0001",
+      "displayName": "User",
+      "roleIds": [1, 2],
+      "joinedAt": "2026-02-15T..."
+    }
+  ]
+}
+```
+
+---
+
+## Limitations & comportements
+
+- **Indexation des documents** :
+  - uniquement `text/*` (si `Content-Type` est absent, le bot tente quand même)
+  - stockée **en mémoire** (`CHANNEL_DOCUMENTS`) → perdu au redémarrage
+- **/qa** :
+  - chaque document est tronqué à 2000 caractères lors de la construction du contexte
+  - le contexte complet peut devenir très gros si beaucoup de fichiers sont envoyés (risque d’être tronqué côté `OllamaClient` à 2000 au moment de l’envoi)
+- **Découpage Discord** : réponses découpées en morceaux de 2000 caractères maximum
+- **Troncature backend** : `OllamaClient` tronque `message` à 2000 chars pour éviter un rejet (observé) côté backend
+
+---
+
+## Développement
+
+### Tests
+
+Un test JUnit couvre `MessageUtils` : `src/test/java/.../MessageUtilsTest.java`.
+
+Lancer les tests :
+
+```powershell
+mvn test
+```
+
+### Build
+
+```powershell
+mvn package
+```
+
+---
+
+## Dépannage
+
+### Le bot ne démarre pas / token null
+
+- Vérifiez que `.env` est présent à la racine du projet (répertoire de lancement)
+- Vérifiez `DISCORD_TOKEN`
+
+### Les commandes slash n’apparaissent pas
+
+- Les commandes sont enregistrées comme **globales** : la propagation peut prendre quelques minutes.
+- Vérifiez les logs au démarrage : le bot log “déjà enregistrée” ou “enregistrement…”.
+
+### `/qa` dit “Aucun document indexé”
+
+- Envoyez une pièce jointe texte dans **le même salon**, attendez la log “Texte indexé…”, puis relancez `/qa`.
+
+### Le backend renvoie HTTP 4xx/5xx
+
+- Vérifiez `BACKEND_BASE_URL`
+- Vérifiez que les routes existent et acceptent le JSON attendu
+- Le bot tronque certains corps d’erreur (pour éviter d’afficher du HTML trop long)
+
+### Messages coupés / formatage bizarre
+
+- Le bot échappe une partie du markdown (`*`, `_`, `` ` ``, `~`, `\`) via `MessageUtils.escapeDiscordMarkdown`.
+- Les réponses sont découpées à 2000 caractères.
+
+---
+
+## Licence
+
+Projet pédagogique / étudiant (aucune licence spécifiée dans le dépôt à ce stade).
